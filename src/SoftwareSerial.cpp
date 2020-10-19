@@ -1,15 +1,8 @@
 /*
-SoftwareSerial.cpp (formerly NewSoftSerial.cpp) - 
-Multi-instance software serial library for Arduino/Wiring
--- Interrupt-driven receive and other improvements by ladyada
-   (http://ladyada.net)
--- Tuning, circular buffer, derivation from class Print/Stream,
-   multi-instance support, porting to 8MHz processors,
-   various optimizations, PROGMEM delay tables, inverse logic and 
-   direct port writing by Mikal Hart (http://www.arduiniana.org)
--- Pin change interrupt macros by Paul Stoffregen (http://www.pjrc.com)
--- 20MHz processor support by Garrett Mace (http://www.macetech.com)
--- ATmega1280/2560 support by Brett Hagman (http://www.roguerobotics.com/)
+
+SoftwareSerial.cpp - Implementation of the Arduino software serial for ESP8266/ESP32.
+Copyright (c) 2015-2016 Peter Lerup. All rights reserved.
+Copyright (c) 2018-2019 Dirk O. Kaar. All rights reserved.
 
 This library is free software; you can redistribute it and/or
 modify it under the terms of the GNU Lesser General Public
@@ -25,653 +18,536 @@ You should have received a copy of the GNU Lesser General Public
 License along with this library; if not, write to the Free Software
 Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
-The latest version of this library can always be found at
-http://arduiniana.org.
 */
 
-// When set, _DEBUG co-opts pins 11 and 13 for debugging with an
-// oscilloscope or logic analyzer.  Beware: it also slightly modifies
-// the bit times, so don't rely on it too much at high baud rates
-#define _DEBUG 0
-#define _DEBUG_PIN1 11
-#define _DEBUG_PIN2 13
-// 
-// Includes
-// 
-#include <avr/interrupt.h>
-#include <avr/pgmspace.h>
+#include "SoftwareSerial.h"
 #include <Arduino.h>
-#include <SoftwareSerial.h>
 
-
-#if defined(__MK20DX128__) || defined(__MK20DX256__) || defined(__MKL26Z64__) || defined(__MK64FX512__) || defined(__MK66FX1M0__) || defined(__IMXRT1052__) || defined(__IMXRT1062__)
-
-SoftwareSerial::SoftwareSerial(uint8_t rxPin, uint8_t txPin, bool inverse_logic /* = false */)
-{
-	buffer_overflow = false;
-	#if defined(__IMXRT1052__) || defined(__IMXRT1062__)
-	if (rxPin == 0 && txPin == 1) {
-		port = &Serial1;
-		return;
-	} else if (rxPin == 6 && txPin == 7) {
-		port = &Serial2;
-		return;
-	} else if (rxPin == 14 && txPin == 15) {
-		port = &Serial3;
-		return;
-	} else if (rxPin == 16 && txPin == 17) {
-		port = &Serial4;
-		return;
-	} else if (rxPin == 21 && txPin == 20) {
-		port = &Serial5;
-		return;
-	} else if (rxPin == 25 && txPin == 24) {
-		port = &Serial6;
-		return;
-	} else if (rxPin == 28 && txPin == 29) {
-		port = &Serial7;
-		return;
-	}	
-	#else
-	if (rxPin == 0 && txPin == 1) {
-		port = &Serial1;
-		return;
-	} else if (rxPin == 9 && txPin == 10) {
-		port = &Serial2;
-		return;
-	} else if (rxPin == 7 && txPin == 8) {
-		port = &Serial3;
-		return;
-	}
-	#endif
-	port = NULL;
-	pinMode(txPin, OUTPUT);
-	pinMode(rxPin, INPUT_PULLUP);
-	txpin = txPin;
-	rxpin = rxPin;
-	txreg = portOutputRegister(digitalPinToPort(txPin));
-	rxreg = portInputRegister(digitalPinToPort(rxPin));
-	cycles_per_bit = 0;
-}
-
-void SoftwareSerial::begin(unsigned long speed)
-{
-	if (port) {
-		port->begin(speed);
-	} else {
-		cycles_per_bit = (uint32_t)(F_CPU + speed / 2) / speed;
-		ARM_DEMCR |= ARM_DEMCR_TRCENA;
-		ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
-	}
-}
-
-void SoftwareSerial::end()
-{
-	if (port) {
-		port->end();
-		port = NULL;
-	} else {
-		pinMode(txpin, INPUT);
-		pinMode(rxpin, INPUT);
-	}
-	cycles_per_bit = 0;
-}
-
-// The worst case expected length of any interrupt routines.  If an
-// interrupt runs longer than this number of cycles, it can disrupt
-// the transmit waveform.  Increasing this number causes SoftwareSerial
-// to hog the CPU longer, delaying all interrupt response for other
-// libraries, so this should be made as small as possible but still
-// ensure accurate transmit waveforms.
-#define WORST_INTERRUPT_CYCLES 360
-
-static void wait_for_target(uint32_t begin, uint32_t target)
-{
-	if (target - (ARM_DWT_CYCCNT - begin) > WORST_INTERRUPT_CYCLES+20) {
-		uint32_t pretarget = target - WORST_INTERRUPT_CYCLES;
-		//digitalWriteFast(12, HIGH);
-		interrupts();
-		while (ARM_DWT_CYCCNT - begin < pretarget) ; // wait
-		noInterrupts();
-		//digitalWriteFast(12, LOW);
-	}
-	while (ARM_DWT_CYCCNT - begin < target) ; // wait
-}
-
-size_t SoftwareSerial::write(uint8_t b)
-{
-	elapsedMicros elapsed;
-	uint32_t target;
-	uint8_t mask;
-	uint32_t begin_cycle;
-
-	// use hardware serial, if possible
-	if (port) return port->write(b);
-	if (cycles_per_bit == 0) return 0;
-	ARM_DEMCR |= ARM_DEMCR_TRCENA;
-	ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
-	// start bit
-	target = cycles_per_bit;
-	noInterrupts();
-	begin_cycle = ARM_DWT_CYCCNT;
-	*txreg = 0;
-	wait_for_target(begin_cycle, target);
-	// 8 data bits
-	for (mask = 1; mask; mask <<= 1) {
-		*txreg = (b & mask) ? 1 : 0;
-		target += cycles_per_bit;
-		wait_for_target(begin_cycle, target);
-	}
-	// stop bit
-	*txreg = 1;
-	interrupts();
-	target += cycles_per_bit;
-	while (ARM_DWT_CYCCNT - begin_cycle < target) ; // wait
-	return 1;
-}
-
-void SoftwareSerial::flush()
-{
-	if (port) port->flush();
-}
-
-// TODO implement reception using pin change DMA capturing
-// ARM_DWT_CYCCNT and the bitband mapped GPIO_PDIR register
-// to a circular buffer (8 bytes per event... memory intensive)
-
-int SoftwareSerial::available()
-{
-	if (port) return port->available();
-	return 0;
-}
-
-int SoftwareSerial::peek()
-{
-	if (port) return port->peek();
-	return -1;
-}
-
-int SoftwareSerial::read()
-{
-	if (port) return port->read();
-	return -1;
-}
-
-#else
-
-//
-// Lookup table
-//
-typedef struct _DELAY_TABLE
-{
-  long baud;
-  unsigned short rx_delay_centering;
-  unsigned short rx_delay_intrabit;
-  unsigned short rx_delay_stopbit;
-  unsigned short tx_delay;
-} DELAY_TABLE;
-
-#if F_CPU == 16000000
-
-static const DELAY_TABLE PROGMEM table[] = 
-{
-  //  baud    rxcenter   rxintra    rxstop    tx
-  { 115200,   1,         17,        17,       12,    },
-  { 57600,    10,        37,        37,       33,    },
-  { 38400,    25,        57,        57,       54,    },
-  { 31250,    31,        70,        70,       68,    },
-  { 28800,    34,        77,        77,       74,    },
-  { 19200,    54,        117,       117,      114,   },
-  { 14400,    74,        156,       156,      153,   },
-  { 9600,     114,       236,       236,      233,   },
-  { 4800,     233,       474,       474,      471,   },
-  { 2400,     471,       950,       950,      947,   },
-  { 1200,     947,       1902,      1902,     1899,  },
-  { 600,      1902,      3804,      3804,     3800,  },
-  { 300,      3804,      7617,      7617,     7614,  },
-};
-
-const int XMIT_START_ADJUSTMENT = 5;
-
-#elif F_CPU == 8000000
-
-static const DELAY_TABLE table[] PROGMEM = 
-{
-  //  baud    rxcenter    rxintra    rxstop  tx
-  { 115200,   1,          5,         5,      3,      },
-  { 57600,    1,          15,        15,     13,     },
-  { 38400,    2,          25,        26,     23,     },
-  { 31250,    7,          32,        33,     29,     },
-  { 28800,    11,         35,        35,     32,     },
-  { 19200,    20,         55,        55,     52,     },
-  { 14400,    30,         75,        75,     72,     },
-  { 9600,     50,         114,       114,    112,    },
-  { 4800,     110,        233,       233,    230,    },
-  { 2400,     229,        472,       472,    469,    },
-  { 1200,     467,        948,       948,    945,    },
-  { 600,      948,        1895,      1895,   1890,   },
-  { 300,      1895,       3805,      3805,   3802,   },
-};
-
-const int XMIT_START_ADJUSTMENT = 4;
-
-#elif F_CPU == 20000000
-
-// 20MHz support courtesy of the good people at macegr.com.
-// Thanks, Garrett!
-
-static const DELAY_TABLE PROGMEM table[] =
-{
-  //  baud    rxcenter    rxintra    rxstop  tx
-  { 115200,   3,          21,        21,     18,     },
-  { 57600,    20,         43,        43,     41,     },
-  { 38400,    37,         73,        73,     70,     },
-  { 31250,    45,         89,        89,     88,     },
-  { 28800,    46,         98,        98,     95,     },
-  { 19200,    71,         148,       148,    145,    },
-  { 14400,    96,         197,       197,    194,    },
-  { 9600,     146,        297,       297,    294,    },
-  { 4800,     296,        595,       595,    592,    },
-  { 2400,     592,        1189,      1189,   1186,   },
-  { 1200,     1187,       2379,      2379,   2376,   },
-  { 600,      2379,       4759,      4759,   4755,   },
-  { 300,      4759,       9523,      9523,   9520,   },
-};
-
-const int XMIT_START_ADJUSTMENT = 6;
-
-#else
-
-#error This version of SoftwareSerial supports only 20, 16 and 8MHz processors
-
+#ifdef ESP32
+#define xt_rsil(a) (a)
+#define xt_wsr_ps(a)
 #endif
 
-//
-// Statics
-//
-SoftwareSerial *SoftwareSerial::active_object = 0;
-char SoftwareSerial::_receive_buffer[_SS_MAX_RX_BUFF]; 
-volatile uint8_t SoftwareSerial::_receive_buffer_tail = 0;
-volatile uint8_t SoftwareSerial::_receive_buffer_head = 0;
+constexpr uint8_t BYTE_ALL_BITS_SET = ~static_cast<uint8_t>(0);
 
-//
-// Debugging
-//
-// This function generates a brief pulse
-// for debugging or measuring on an oscilloscope.
-inline void DebugPulse(uint8_t pin, uint8_t count)
-{
-#if _DEBUG
-  volatile uint8_t *pport = portOutputRegister(digitalPinToPort(pin));
-
-  uint8_t val = *pport;
-  while (count--)
-  {
-    *pport = val | digitalPinToBitMask(pin);
-    *pport = val;
-  }
-#endif
+SoftwareSerial::SoftwareSerial() {
+    m_isrOverflow = false;
 }
 
-//
-// Private methods
-//
-
-/* static */ 
-inline void SoftwareSerial::tunedDelay(uint16_t delay) { 
-  uint8_t tmp=0;
-
-  asm volatile("sbiw    %0, 0x01 \n\t"
-    "ldi %1, 0xFF \n\t"
-    "cpi %A0, 0xFF \n\t"
-    "cpc %B0, %1 \n\t"
-    "brne .-10 \n\t"
-    : "+r" (delay), "+a" (tmp)
-    : "0" (delay)
-    );
+SoftwareSerial::SoftwareSerial(int8_t rxPin, int8_t txPin, bool invert)
+{
+    m_isrOverflow = false;
+    m_rxPin = rxPin;
+    m_txPin = txPin;
+    m_invert = invert;
 }
 
-// This function sets the current object as the "listening"
-// one and returns true if it replaces another 
-bool SoftwareSerial::listen()
-{
-  if (active_object != this)
-  {
-    _buffer_overflow = false;
-    uint8_t oldSREG = SREG;
-    cli();
-    _receive_buffer_head = _receive_buffer_tail = 0;
-    active_object = this;
-    SREG = oldSREG;
+SoftwareSerial::~SoftwareSerial() {
+    end();
+}
+
+bool SoftwareSerial::isValidGPIOpin(int8_t pin) {
+#if defined(ESP8266)
+    return (pin >= 0 && pin <= 16) && !isFlashInterfacePin(pin);
+#elif defined(ESP32)
+    return (pin >= 0 && pin <= 5) || (pin >= 12 && pin <= 19) ||
+        (pin >= 21 && pin <= 23) || (pin >= 25 && pin <= 27) || (pin >= 32 && pin <= 35);
+#else
     return true;
-  }
-
-  return false;
+#endif
 }
 
-//
-// The receive routine called by the interrupt handler
-//
-void SoftwareSerial::recv()
-{
+bool SoftwareSerial::isValidRxGPIOpin(int8_t pin) {
+    return isValidGPIOpin(pin)
+#if defined(ESP8266)
+        && (pin != 16)
+#endif
+        ;
+}
 
-#if GCC_VERSION < 40302
-// Work-around for avr-gcc 4.3.0 OSX version bug
-// Preserve the registers that the compiler misses
-// (courtesy of Arduino forum user *etracer*)
-  asm volatile(
-    "push r18 \n\t"
-    "push r19 \n\t"
-    "push r20 \n\t"
-    "push r21 \n\t"
-    "push r22 \n\t"
-    "push r23 \n\t"
-    "push r26 \n\t"
-    "push r27 \n\t"
-    ::);
-#endif  
-
-  uint8_t d = 0;
-
-  // If RX line is high, then we don't see any start bit
-  // so interrupt is probably not for us
-  if (_inverse_logic ? rx_pin_read() : !rx_pin_read())
-  {
-    // Wait approximately 1/2 of a bit width to "center" the sample
-    tunedDelay(_rx_delay_centering);
-    DebugPulse(_DEBUG_PIN2, 1);
-
-    // Read each of the 8 bits
-    for (uint8_t i=0x1; i; i <<= 1)
-    {
-      tunedDelay(_rx_delay_intrabit);
-      DebugPulse(_DEBUG_PIN2, 1);
-      uint8_t noti = ~i;
-      if (rx_pin_read())
-        d |= i;
-      else // else clause added to ensure function timing is ~balanced
-        d &= noti;
+void SoftwareSerial::begin(uint32_t baud, SoftwareSerialConfig config,
+    int8_t rxPin, int8_t txPin,
+    bool invert, int bufCapacity, int isrBufCapacity) {
+    if (-1 != rxPin) m_rxPin = rxPin;
+    if (-1 != txPin) m_txPin = txPin;
+    m_oneWire = (m_rxPin == m_txPin);
+    m_invert = invert;
+    m_dataBits = 5 + (config & 07);
+    m_parityMode = static_cast<SoftwareSerialParity>(config & 070);
+    m_stopBits = 1 + ((config & 0300) ? 1 : 0);
+    m_pduBits = m_dataBits + static_cast<bool>(m_parityMode) + m_stopBits;
+    m_bitCycles = (ESP.getCpuFreqMHz() * 1000000UL + baud / 2) / baud;
+    m_intTxEnabled = true;
+    if (isValidRxGPIOpin(m_rxPin)) {
+        m_buffer.reset(new circular_queue<uint8_t>((bufCapacity > 0) ? bufCapacity : 64));
+        if (m_parityMode)
+        {
+            m_parityBuffer.reset(new circular_queue<uint8_t>((m_buffer->capacity() + 7) / 8));
+            m_parityInPos = m_parityOutPos = 1;
+        }
+        m_isrBuffer.reset(new circular_queue<uint32_t>((isrBufCapacity > 0) ?
+            isrBufCapacity : m_buffer->capacity() * (2 + m_dataBits + static_cast<bool>(m_parityMode))));
+        if (m_buffer && (!m_parityMode || m_parityBuffer) && m_isrBuffer) {
+            m_rxValid = true;
+            pinMode(m_rxPin, INPUT_PULLUP);
+        }
     }
-
-    // skip the stop bit
-    tunedDelay(_rx_delay_stopbit);
-    DebugPulse(_DEBUG_PIN2, 1);
-
-    if (_inverse_logic)
-      d = ~d;
-
-    // if buffer full, set the overflow flag and return
-    if ((_receive_buffer_tail + 1) % _SS_MAX_RX_BUFF != _receive_buffer_head) 
-    {
-      // save new data in buffer: tail points to where byte goes
-      _receive_buffer[_receive_buffer_tail] = d; // save new byte
-      _receive_buffer_tail = (_receive_buffer_tail + 1) % _SS_MAX_RX_BUFF;
-    } 
-    else 
-    {
-#if _DEBUG // for scope: pulse pin as overflow indictator
-      DebugPulse(_DEBUG_PIN1, 1);
-#endif
-      _buffer_overflow = true;
+    if (isValidGPIOpin(m_txPin)) {
+        m_txValid = true;
+        if (!m_oneWire) {
+            pinMode(m_txPin, OUTPUT);
+            digitalWrite(m_txPin, !m_invert);
+        }
     }
-  }
-
-#if GCC_VERSION < 40302
-// Work-around for avr-gcc 4.3.0 OSX version bug
-// Restore the registers that the compiler misses
-  asm volatile(
-    "pop r27 \n\t"
-    "pop r26 \n\t"
-    "pop r23 \n\t"
-    "pop r22 \n\t"
-    "pop r21 \n\t"
-    "pop r20 \n\t"
-    "pop r19 \n\t"
-    "pop r18 \n\t"
-    ::);
-#endif
-}
-
-void SoftwareSerial::tx_pin_write(uint8_t pin_state)
-{
-  if (pin_state == LOW)
-    *_transmitPortRegister &= ~_transmitBitMask;
-  else
-    *_transmitPortRegister |= _transmitBitMask;
-}
-
-uint8_t SoftwareSerial::rx_pin_read()
-{
-  return *_receivePortRegister & _receiveBitMask;
-}
-
-//
-// Interrupt handling
-//
-
-/* static */
-inline void SoftwareSerial::handle_interrupt()
-{
-  if (active_object)
-  {
-    active_object->recv();
-  }
-}
-
-#if defined(PCINT0_vect)
-ISR(PCINT0_vect)
-{
-  SoftwareSerial::handle_interrupt();
-}
-#endif
-
-#if defined(PCINT1_vect)
-ISR(PCINT1_vect)
-{
-  SoftwareSerial::handle_interrupt();
-}
-#endif
-
-#if defined(PCINT2_vect)
-ISR(PCINT2_vect)
-{
-  SoftwareSerial::handle_interrupt();
-}
-#endif
-
-#if defined(PCINT3_vect)
-ISR(PCINT3_vect)
-{
-  SoftwareSerial::handle_interrupt();
-}
-#endif
-
-//
-// Constructor
-//
-SoftwareSerial::SoftwareSerial(uint8_t receivePin, uint8_t transmitPin, bool inverse_logic /* = false */) : 
-  _rx_delay_centering(0),
-  _rx_delay_intrabit(0),
-  _rx_delay_stopbit(0),
-  _tx_delay(0),
-  _buffer_overflow(false),
-  _inverse_logic(inverse_logic)
-{
-  setTX(transmitPin);
-  setRX(receivePin);
-}
-
-//
-// Destructor
-//
-SoftwareSerial::~SoftwareSerial()
-{
-  end();
-}
-
-void SoftwareSerial::setTX(uint8_t tx)
-{
-  pinMode(tx, OUTPUT);
-  digitalWrite(tx, HIGH);
-  _transmitBitMask = digitalPinToBitMask(tx);
-  uint8_t port = digitalPinToPort(tx);
-  _transmitPortRegister = portOutputRegister(port);
-}
-
-void SoftwareSerial::setRX(uint8_t rx)
-{
-  pinMode(rx, INPUT);
-  if (!_inverse_logic)
-    digitalWrite(rx, HIGH);  // pullup for normal logic!
-  _receivePin = rx;
-  _receiveBitMask = digitalPinToBitMask(rx);
-  uint8_t port = digitalPinToPort(rx);
-  _receivePortRegister = portInputRegister(port);
-}
-
-//
-// Public methods
-//
-
-void SoftwareSerial::begin(long speed)
-{
-  _rx_delay_centering = _rx_delay_intrabit = _rx_delay_stopbit = _tx_delay = 0;
-
-  for (unsigned i=0; i<sizeof(table)/sizeof(table[0]); ++i)
-  {
-    long baud = pgm_read_dword(&table[i].baud);
-    if (baud == speed)
-    {
-      _rx_delay_centering = pgm_read_word(&table[i].rx_delay_centering);
-      _rx_delay_intrabit = pgm_read_word(&table[i].rx_delay_intrabit);
-      _rx_delay_stopbit = pgm_read_word(&table[i].rx_delay_stopbit);
-      _tx_delay = pgm_read_word(&table[i].tx_delay);
-      break;
-    }
-  }
-
-  // Set up RX interrupts, but only if we have a valid RX baud rate
-  if (_rx_delay_stopbit)
-  {
-    if (digitalPinToPCICR(_receivePin))
-    {
-      *digitalPinToPCICR(_receivePin) |= _BV(digitalPinToPCICRbit(_receivePin));
-      *digitalPinToPCMSK(_receivePin) |= _BV(digitalPinToPCMSKbit(_receivePin));
-    }
-    tunedDelay(_tx_delay); // if we were low this establishes the end
-  }
-
-#if _DEBUG
-  pinMode(_DEBUG_PIN1, OUTPUT);
-  pinMode(_DEBUG_PIN2, OUTPUT);
-#endif
-
-  listen();
+    if (!m_rxEnabled) { enableRx(true); }
 }
 
 void SoftwareSerial::end()
 {
-  if (digitalPinToPCMSK(_receivePin))
-    *digitalPinToPCMSK(_receivePin) &= ~_BV(digitalPinToPCMSKbit(_receivePin));
-}
-
-
-// Read data from buffer
-int SoftwareSerial::read()
-{
-  if (!isListening())
-    return -1;
-
-  // Empty buffer?
-  if (_receive_buffer_head == _receive_buffer_tail)
-    return -1;
-
-  // Read from "head"
-  uint8_t d = _receive_buffer[_receive_buffer_head]; // grab next byte
-  _receive_buffer_head = (_receive_buffer_head + 1) % _SS_MAX_RX_BUFF;
-  return d;
-}
-
-int SoftwareSerial::available()
-{
-  if (!isListening())
-    return 0;
-
-  return (_receive_buffer_tail + _SS_MAX_RX_BUFF - _receive_buffer_head) % _SS_MAX_RX_BUFF;
-}
-
-size_t SoftwareSerial::write(uint8_t b)
-{
-  if (_tx_delay == 0) {
-    setWriteError();
-    return 0;
-  }
-
-  uint8_t oldSREG = SREG;
-  cli();  // turn off interrupts for a clean txmit
-
-  // Write the start bit
-  tx_pin_write(_inverse_logic ? HIGH : LOW);
-  tunedDelay(_tx_delay + XMIT_START_ADJUSTMENT);
-
-  // Write each of the 8 bits
-  if (_inverse_logic)
-  {
-    for (byte mask = 0x01; mask; mask <<= 1)
-    {
-      if (b & mask) // choose bit
-        tx_pin_write(LOW); // send 1
-      else
-        tx_pin_write(HIGH); // send 0
-    
-      tunedDelay(_tx_delay);
+    enableRx(false);
+    m_txValid = false;
+    if (m_buffer) {
+        m_buffer.reset();
     }
-
-    tx_pin_write(LOW); // restore pin to natural state
-  }
-  else
-  {
-    for (byte mask = 0x01; mask; mask <<= 1)
-    {
-      if (b & mask) // choose bit
-        tx_pin_write(HIGH); // send 1
-      else
-        tx_pin_write(LOW); // send 0
-    
-      tunedDelay(_tx_delay);
+    m_parityBuffer.reset();
+    if (m_isrBuffer) {
+        m_isrBuffer.reset();
     }
-
-    tx_pin_write(HIGH); // restore pin to natural state
-  }
-
-  SREG = oldSREG; // turn interrupts back on
-  tunedDelay(_tx_delay);
-  
-  return 1;
 }
 
-void SoftwareSerial::flush()
-{
-  if (!isListening())
-    return;
-
-  uint8_t oldSREG = SREG;
-  cli();
-  _receive_buffer_head = _receive_buffer_tail = 0;
-  SREG = oldSREG;
+uint32_t SoftwareSerial::baudRate() {
+    return ESP.getCpuFreqMHz() * 1000000UL / m_bitCycles;
 }
 
-int SoftwareSerial::peek()
-{
-  if (!isListening())
-    return -1;
-
-  // Empty buffer?
-  if (_receive_buffer_head == _receive_buffer_tail)
-    return -1;
-
-  // Read from "head"
-  return _receive_buffer[_receive_buffer_head];
+void SoftwareSerial::setTransmitEnablePin(int8_t txEnablePin) {
+    if (isValidGPIOpin(txEnablePin)) {
+        m_txEnableValid = true;
+        m_txEnablePin = txEnablePin;
+        pinMode(m_txEnablePin, OUTPUT);
+        digitalWrite(m_txEnablePin, LOW);
+    }
+    else {
+        m_txEnableValid = false;
+    }
 }
 
+void SoftwareSerial::enableIntTx(bool on) {
+    m_intTxEnabled = on;
+}
+
+void SoftwareSerial::enableTx(bool on) {
+    if (m_txValid && m_oneWire) {
+        if (on) {
+            enableRx(false);
+            pinMode(m_txPin, OUTPUT);
+            digitalWrite(m_txPin, !m_invert);
+        }
+        else {
+            pinMode(m_rxPin, INPUT_PULLUP);
+            enableRx(true);
+        }
+    }
+}
+
+void SoftwareSerial::enableRx(bool on) {
+    if (m_rxValid) {
+        if (on) {
+            m_rxCurBit = m_pduBits - 1;
+            // Init to stop bit level and current cycle
+            m_isrLastCycle = (ESP.getCycleCount() | 1) ^ m_invert;
+            if (m_bitCycles >= (ESP.getCpuFreqMHz() * 1000000UL) / 74880UL)
+                attachInterruptArg(digitalPinToInterrupt(m_rxPin), reinterpret_cast<void (*)(void*)>(rxBitISR), this, CHANGE);
+            else
+                attachInterruptArg(digitalPinToInterrupt(m_rxPin), reinterpret_cast<void (*)(void*)>(rxBitSyncISR), this, m_invert ? RISING : FALLING);
+        }
+        else {
+            detachInterrupt(digitalPinToInterrupt(m_rxPin));
+        }
+        m_rxEnabled = on;
+    }
+}
+
+int SoftwareSerial::read() {
+    if (!m_rxValid) { return -1; }
+    if (!m_buffer->available()) {
+        rxBits();
+        if (!m_buffer->available()) { return -1; }
+    }
+    auto val = m_buffer->pop();
+    if (m_parityBuffer)
+    {
+        m_lastReadParity = m_parityBuffer->peek() & m_parityOutPos;
+        m_parityOutPos <<= 1;
+        if (!m_parityOutPos)
+        {
+            m_parityOutPos = 1;
+            m_parityBuffer->pop();
+        }
+    }
+    return val;
+}
+
+size_t SoftwareSerial::read(uint8_t* buffer, size_t size) {
+    if (!m_rxValid) { return 0; }
+    size_t avail;
+    if (0 == (avail = m_buffer->pop_n(buffer, size))) {
+        rxBits();
+        avail = m_buffer->pop_n(buffer, size);
+    }
+    if (!avail) return 0;
+    if (m_parityBuffer) {
+        uint32_t parityBits = avail;
+        while (m_parityOutPos >>= 1) ++parityBits;
+        m_parityOutPos = (1 << (parityBits % 8));
+        m_parityBuffer->pop_n(nullptr, parityBits / 8);
+    }
+    return avail;
+}
+
+size_t SoftwareSerial::readBytes(uint8_t* buffer, size_t size) {
+    if (!m_rxValid || !size) { return 0; }
+    size_t count = 0;
+    auto start = millis();
+    do {
+        auto readCnt = read(&buffer[count], size - count);
+        count += readCnt;
+        if (count >= size) break;
+        if (readCnt) start = millis();
+        else optimistic_yield(1000UL);
+    } while (millis() - start < _timeout);
+    return count;
+}
+
+int SoftwareSerial::available() {
+    if (!m_rxValid) { return 0; }
+    rxBits();
+    int avail = m_buffer->available();
+    if (!avail) {
+        optimistic_yield(10000UL);
+    }
+    return avail;
+}
+
+void ICACHE_RAM_ATTR SoftwareSerial::preciseDelay(bool sync) {
+    if (!sync)
+    {
+        // Reenable interrupts while delaying to avoid other tasks piling up
+        if (!m_intTxEnabled) { xt_wsr_ps(m_savedPS); }
+        const auto expired = ESP.getCycleCount() - m_periodStart;
+        const auto ms = (m_periodDuration - expired) / ESP.getCpuFreqMHz() / 1000UL;
+        if (ms)
+        {
+            delay(ms);
+        }
+        else
+        {
+            do
+            {
+                optimistic_yield(10000UL);
+            }
+            while ((ESP.getCycleCount() - m_periodStart) < m_periodDuration);
+        }
+        // Disable interrupts again
+        if (!m_intTxEnabled) { m_savedPS = xt_rsil(15); }
+    }
+    else
+    {
+        while ((ESP.getCycleCount() - m_periodStart) < m_periodDuration) {}
+    }
+    m_periodDuration = 0;
+    m_periodStart = ESP.getCycleCount();
+}
+
+void ICACHE_RAM_ATTR SoftwareSerial::writePeriod(
+    uint32_t dutyCycle, uint32_t offCycle, bool withStopBit) {
+    preciseDelay(true);
+    if (dutyCycle)
+    {
+        digitalWrite(m_txPin, HIGH);
+        m_periodDuration += dutyCycle;
+        if (offCycle || (withStopBit && !m_invert)) preciseDelay(!withStopBit || m_invert);
+    }
+    if (offCycle)
+    {
+        digitalWrite(m_txPin, LOW);
+        m_periodDuration += offCycle;
+        if (withStopBit && m_invert) preciseDelay(false);
+    }
+}
+
+size_t SoftwareSerial::write(uint8_t byte) {
+    return write(&byte, 1);
+}
+
+size_t SoftwareSerial::write(uint8_t byte, SoftwareSerialParity parity) {
+    return write(&byte, 1, parity);
+}
+
+size_t SoftwareSerial::write(const uint8_t* buffer, size_t size) {
+    return write(buffer, size, m_parityMode);
+}
+
+size_t ICACHE_RAM_ATTR SoftwareSerial::write(const uint8_t* buffer, size_t size, SoftwareSerialParity parity) {
+    if (m_rxValid) { rxBits(); }
+    if (!m_txValid) { return -1; }
+
+    if (m_txEnableValid) {
+        digitalWrite(m_txEnablePin, HIGH);
+    }
+    // Stop bit: if inverted, LOW, otherwise HIGH
+    bool b = !m_invert;
+    uint32_t dutyCycle = 0;
+    uint32_t offCycle = 0;
+    if (!m_intTxEnabled) {
+        // Disable interrupts in order to get a clean transmit timing
+        m_savedPS = xt_rsil(15);
+    }
+    const uint32_t dataMask = ((1UL << m_dataBits) - 1);
+    bool withStopBit = true;
+    m_periodDuration = 0;
+    m_periodStart = ESP.getCycleCount();
+    for (size_t cnt = 0; cnt < size; ++cnt) {
+        uint8_t byte = pgm_read_byte(buffer + cnt) & dataMask;
+        // push LSB start-data-parity-stop bit pattern into uint32_t
+        // Stop bits: HIGH
+        uint32_t word = ~0UL;
+        // inverted parity bit, performance tweak for xor all-bits-set word
+        if (parity && m_parityMode)
+        {
+            uint32_t parityBit;
+            switch (parity)
+            {
+            case SWSERIAL_PARITY_EVEN:
+                // from inverted, so use odd parity
+                parityBit = byte;
+                parityBit ^= parityBit >> 4;
+                parityBit &= 0xf;
+                parityBit = (0x9669 >> parityBit) & 1;
+                break;
+            case SWSERIAL_PARITY_ODD:
+                // from inverted, so use even parity
+                parityBit = byte;
+                parityBit ^= parityBit >> 4;
+                parityBit &= 0xf;
+                parityBit = (0x6996 >> parityBit) & 1;
+                break;
+            case SWSERIAL_PARITY_MARK:
+                parityBit = 0;
+                break;
+            case SWSERIAL_PARITY_SPACE:
+                // suppresses warning parityBit uninitialized
+            default:
+                parityBit = 1;
+                break;
+            }
+            word ^= parityBit;
+        }
+        word <<= m_dataBits;
+        word |= byte;
+        // Start bit: LOW
+        word <<= 1;
+        if (m_invert) word = ~word;
+        for (int i = 0; i <= m_pduBits; ++i) {
+            bool pb = b;
+            b = word & (1UL << i);
+            if (!pb && b) {
+                writePeriod(dutyCycle, offCycle, withStopBit);
+                withStopBit = false;
+                dutyCycle = offCycle = 0;
+            }
+            if (b) {
+                dutyCycle += m_bitCycles;
+            }
+            else {
+                offCycle += m_bitCycles;
+            }
+        }
+        withStopBit = true;
+    }
+    writePeriod(dutyCycle, offCycle, true);
+    if (!m_intTxEnabled) {
+        // restore the interrupt state
+        xt_wsr_ps(m_savedPS);
+    }
+    if (m_txEnableValid) {
+        digitalWrite(m_txEnablePin, LOW);
+    }
+    return size;
+}
+
+void SoftwareSerial::flush() {
+    if (!m_rxValid) { return; }
+    m_buffer->flush();
+    if (m_parityBuffer)
+    {
+        m_parityInPos = m_parityOutPos = 1;
+        m_parityBuffer->flush();
+    }
+}
+
+bool SoftwareSerial::overflow() {
+    bool res = m_overflow;
+    m_overflow = false;
+    return res;
+}
+
+int SoftwareSerial::peek() {
+    if (!m_rxValid) { return -1; }
+    if (!m_buffer->available()) {
+        rxBits();
+        if (!m_buffer->available()) return -1;
+    }
+    auto val = m_buffer->peek();
+    if (m_parityBuffer) m_lastReadParity = m_parityBuffer->peek() & m_parityOutPos;
+    return val;
+}
+
+void SoftwareSerial::rxBits() {
+    int isrAvail = m_isrBuffer->available();
+#ifdef ESP8266
+    if (m_isrOverflow.load()) {
+        m_overflow = true;
+        m_isrOverflow.store(false);
+    }
+#else
+    if (m_isrOverflow.exchange(false)) {
+        m_overflow = true;
+    }
 #endif
+
+    // stop bit can go undetected if leading data bits are at same level
+    // and there was also no next start bit yet, so one byte may be pending.
+    // low-cost check first
+    if (!isrAvail && m_rxCurBit >= -1 && m_rxCurBit < m_pduBits - m_stopBits) {
+        uint32_t detectionCycles = (m_pduBits - m_stopBits - m_rxCurBit) * m_bitCycles;
+        if (ESP.getCycleCount() - m_isrLastCycle > detectionCycles) {
+            // Produce faux stop bit level, prevents start bit maldetection
+            // cycle's LSB is repurposed for the level bit
+            rxBits(((m_isrLastCycle + detectionCycles) | 1) ^ m_invert);
+        }
+    }
+
+    m_isrBuffer->for_each([this](const uint32_t& isrCycle) { rxBits(isrCycle); });
+}
+
+void SoftwareSerial::rxBits(const uint32_t& isrCycle) {
+    bool level = (m_isrLastCycle & 1) ^ m_invert;
+
+    // error introduced by edge value in LSB of isrCycle is negligible
+    int32_t cycles = isrCycle - m_isrLastCycle;
+    m_isrLastCycle = isrCycle;
+
+    uint8_t bits = cycles / m_bitCycles;
+    if (cycles % m_bitCycles > (m_bitCycles >> 1)) ++bits;
+    while (bits > 0) {
+        // start bit detection
+        if (m_rxCurBit >= (m_pduBits - 1)) {
+            // leading edge of start bit
+            if (level) break;
+            m_rxCurBit = -1;
+            --bits;
+            continue;
+        }
+        // data bits
+        if (m_rxCurBit >= -1 && m_rxCurBit < (m_dataBits - 1)) {
+            int8_t dataBits = min(bits, static_cast<uint8_t>(m_dataBits - 1 - m_rxCurBit));
+            m_rxCurBit += dataBits;
+            bits -= dataBits;
+            m_rxCurByte >>= dataBits;
+            if (level) { m_rxCurByte |= (BYTE_ALL_BITS_SET << (8 - dataBits)); }
+            continue;
+        }
+        // parity bit
+        if (m_parityMode && m_rxCurBit == (m_dataBits - 1)) {
+            ++m_rxCurBit;
+            --bits;
+            m_rxCurParity = level;
+            continue;
+        }
+        // stop bits
+        if (m_rxCurBit < (m_pduBits - m_stopBits - 1)) {
+            ++m_rxCurBit;
+            --bits;
+            continue;
+        }
+        if (m_rxCurBit == (m_pduBits - m_stopBits - 1)) {
+            // Store the received value in the buffer unless we have an overflow
+            // if not high stop bit level, discard word
+            if (level)
+            {
+                m_rxCurByte >>= (sizeof(uint8_t) * 8 - m_dataBits);
+                if (!m_buffer->push(m_rxCurByte)) {
+                    m_overflow = true;
+                }
+                else {
+                    if (m_parityBuffer)
+                    {
+                        if (m_rxCurParity) {
+                            m_parityBuffer->pushpeek() |= m_parityInPos;
+                        }
+                        else {
+                            m_parityBuffer->pushpeek() &= ~m_parityInPos;
+                        }
+                        m_parityInPos <<= 1;
+                        if (!m_parityInPos)
+                        {
+                            m_parityBuffer->push();
+                            m_parityInPos = 1;
+                        }
+                    }
+                }
+            }
+            m_rxCurBit = m_pduBits;
+            // reset to 0 is important for masked bit logic
+            m_rxCurByte = 0;
+            m_rxCurParity = false;
+            break;
+        }
+        break;
+    }
+}
+
+void ICACHE_RAM_ATTR SoftwareSerial::rxBitISR(SoftwareSerial* self) {
+    uint32_t curCycle = ESP.getCycleCount();
+    bool level = digitalRead(self->m_rxPin);
+
+    // Store level and cycle in the buffer unless we have an overflow
+    // cycle's LSB is repurposed for the level bit
+    if (!self->m_isrBuffer->push((curCycle | 1U) ^ !level)) self->m_isrOverflow.store(true);
+}
+
+void ICACHE_RAM_ATTR SoftwareSerial::rxBitSyncISR(SoftwareSerial* self) {
+    uint32_t start = ESP.getCycleCount();
+    uint32_t wait = self->m_bitCycles - 172U;
+
+    bool level = self->m_invert;
+    // Store level and cycle in the buffer unless we have an overflow
+    // cycle's LSB is repurposed for the level bit
+    if (!self->m_isrBuffer->push(((start + wait) | 1U) ^ !level)) self->m_isrOverflow.store(true);
+
+    for (uint32_t i = 0; i < self->m_pduBits; ++i) {
+        while (ESP.getCycleCount() - start < wait) {};
+        wait += self->m_bitCycles;
+
+        // Store level and cycle in the buffer unless we have an overflow
+        // cycle's LSB is repurposed for the level bit
+        if (digitalRead(self->m_rxPin) != level)
+        {
+            if (!self->m_isrBuffer->push(((start + wait) | 1U) ^ level)) self->m_isrOverflow.store(true);
+            level = !level;
+        }
+    }
+}
+
+void SoftwareSerial::onReceive(Delegate<void(int available), void*> handler) {
+    receiveHandler = handler;
+}
+
+void SoftwareSerial::perform_work() {
+    if (!m_rxValid) { return; }
+    rxBits();
+    if (receiveHandler) {
+        int avail = m_buffer->available();
+        if (avail) { receiveHandler(avail); }
+    }
+}
